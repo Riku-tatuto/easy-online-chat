@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>簡易チャット（GitHub Pages + Firebase）</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,"Hiragino Kaku Gothic ProN",Meiryo,Arial;margin:0;padding:0;background:#f6f7fb}
+    .container{max-width:900px;margin:32px auto;padding:20px;background:#fff;border-radius:10px;box-shadow:0 6px 18px rgba(20,20,40,0.06)}
+    h1{margin:0 0 12px;font-size:20px}
+    .row{display:flex;gap:8px;align-items:center;margin-bottom:12px}
+    input[type=text],textarea{flex:1;padding:10px;border-radius:8px;border:1px solid #ddd;font-size:14px}
+    button{padding:10px 12px;border-radius:8px;border:0;background:#0b5fff;color:white;cursor:pointer}
+    button.secondary{background:#6b7280}
+    .small{font-size:13px;color:#555}
+    #roomscreen,#chatscreen{display:none}
+    .messages{height:380px;overflow:auto;border:1px solid #eee;padding:12px;border-radius:8px;background:#fafafa}
+    .msg{margin-bottom:10px;padding:8px;border-radius:8px;display:inline-block;max-width:78%}
+    .msg.self{background:#0b5fff;color:#fff;margin-left:auto}
+    .msg.other{background:#e6e9f7;color:#111}
+    .meta{font-size:12px;color:#666;margin-bottom:6px}
+    .codebox{font-family:monospace;padding:6px 8px;background:#111;color:#fff;border-radius:6px;display:inline-block}
+    .topbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="topbar">
+      <h1>シンプルチャット（GitHub Pages + Firebase）</h1>
+      <div class="small">あなたの表示名: <span id="displayName"></span></div>
+    </div>
+
+    <div id="homescreen">
+      <div class="row">
+        <button id="createBtn">会話を作成</button>
+        <button id="joinBtn" class="secondary">会話に参加</button>
+      </div>
+      <div id="createResult" style="margin-bottom:10px"></div>
+      <div id="joinForm" style="display:none" class="row">
+        <input id="joinCode" type="text" placeholder="会話コードを入力（例: A1b2C3）" />
+        <button id="joinEnter">参加</button>
+      </div>
+      <p class="small">備考: アカウントは不要。入力した名前はクライアントのlocalStorageに保存され、サーバーには保存されません。</p>
+    </div>
+
+    <div id="chatscreen">
+      <div class="row" style="align-items:flex-start;gap:12px;margin-bottom:8px">
+        <div>会話コード: <span id="roomCode" class="codebox"></span></div>
+        <div style="margin-left:auto"><button id="leaveBtn" class="secondary">退出</button></div>
+      </div>
+      <div class="messages" id="messages"></div>
+      <div class="row" style="margin-top:8px">
+        <input id="messageInput" type="text" placeholder="メッセージを入力" />
+        <button id="sendBtn">送信</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Firebase modular SDK (ブラウザ用モジュール) -->
+  <script type="module">
+    // == 必ずここをあなたの Firebase コンソールの値に置き換えてください ==
+    const firebaseConfig = {
+      apiKey: "YOUR_API_KEY",
+      authDomain: "YOUR_PROJECT.firebaseapp.com",
+      databaseURL: "https://YOUR_PROJECT.firebaseio.com",
+      projectId: "YOUR_PROJECT",
+      storageBucket: "YOUR_PROJECT.appspot.com",
+      messagingSenderId: "...",
+      appId: "..."
+    };
+
+    import { initializeApp } from 'https://www.gstatic.com/firebasejs/9.22.2/firebase-app.js'
+    import { getDatabase, ref, set, get, child, push, onChildAdded, serverTimestamp } from 'https://www.gstatic.com/firebasejs/9.22.2/firebase-database.js'
+
+    const app = initializeApp(firebaseConfig)
+    const db = getDatabase(app)
+
+    // --- DOM ---
+    const displayNameEl = document.getElementById('displayName')
+    const createBtn = document.getElementById('createBtn')
+    const joinBtn = document.getElementById('joinBtn')
+    const createResult = document.getElementById('createResult')
+    const joinForm = document.getElementById('joinForm')
+    const joinCodeInput = document.getElementById('joinCode')
+    const joinEnter = document.getElementById('joinEnter')
+    const homeScreen = document.getElementById('homescreen')
+    const chatScreen = document.getElementById('chatscreen')
+    const roomCodeEl = document.getElementById('roomCode')
+    const leaveBtn = document.getElementById('leaveBtn')
+    const messagesEl = document.getElementById('messages')
+    const messageInput = document.getElementById('messageInput')
+    const sendBtn = document.getElementById('sendBtn')
+
+    // --- 名前管理 (localStorage) ---
+    let name = localStorage.getItem('chat_name') || ''
+    async function askNameIfNeeded(){
+      if(!name){
+        name = prompt('表示名を入力してください（サーバーには保存されません）','ゲスト') || 'ゲスト'
+        localStorage.setItem('chat_name', name)
+      }
+      displayNameEl.textContent = name
+    }
+
+    await askNameIfNeeded()
+
+    // --- ヘルパー: 6桁英数字コード生成 ---
+    function genCode(len=6){
+      const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+      let s=''
+      for(let i=0;i<len;i++) s += chars.charAt(Math.floor(Math.random()*chars.length))
+      return s
+    }
+
+    // --- ルーム生成 ---
+    async function createRoom(){
+      createResult.textContent = '生成中……'
+      for(let attempts=0; attempts<6; attempts++){
+        const code = genCode(6)
+        const roomRef = ref(db, `rooms/${code}`)
+        const snap = await get(roomRef)
+        if(!snap.exists()){
+          // create
+          await set(roomRef, {
+            createdAt: Date.now(),
+            creator: name
+          })
+          createResult.innerHTML = `作成しました。コード: <span class=\"codebox\">${code}</span> <button id=\"copyBtn\">コピー</button> <button id=\"openBtn\" class=\"secondary\">開く</button>`
+          document.getElementById('copyBtn').onclick = ()=>navigator.clipboard.writeText(code)
+          document.getElementById('openBtn').onclick = ()=>openRoom(code)
+          return
+        }
+      }
+      createResult.textContent = 'コードの衝突が発生しました。もう一度お試しください。'
+    }
+
+    // --- 参加 ---
+    async function joinRoomByCode(code){
+      if(!code) return alert('コードを入力してください')
+      const roomRef = ref(db, `rooms/${code}`)
+      const snap = await get(roomRef)
+      if(!snap.exists()) return alert('そのコードの会話は存在しません')
+      openRoom(code)
+    }
+
+    // --- チャット画面 ---
+    let currentRoom = null
+    let childListeners = []
+
+    function escapeText(t){
+      const d = document.createTextNode(t)
+      const div = document.createElement('div')
+      div.appendChild(d)
+      return div.innerHTML
+    }
+
+    function clearMessages(){ messagesEl.innerHTML = '' }
+
+    function appendMessage(msg){
+      const div = document.createElement('div')
+      div.className = 'msg ' + (msg.sender === name ? 'self' : 'other')
+      // メタ行
+      const meta = document.createElement('div')
+      meta.className = 'meta'
+      const t = new Date(msg.ts || Date.now())
+      meta.textContent = `${msg.sender} · ${t.toLocaleString()}`
+      const text = document.createElement('div')
+      // safe insertion
+      text.textContent = msg.text
+      div.appendChild(meta)
+      div.appendChild(text)
+      messagesEl.appendChild(div)
+      messagesEl.scrollTop = messagesEl.scrollHeight
+    }
+
+    async function openRoom(code){
+      currentRoom = code
+      roomCodeEl.textContent = code
+      homeScreen.style.display = 'none'
+      createResult.innerHTML = ''
+      joinForm.style.display = 'none'
+      chatScreen.style.display = 'block'
+      clearMessages()
+
+      const msgsRef = ref(db, `rooms/${code}/messages`)
+
+      // onChildAdded
+      onChildAdded(msgsRef, (snapshot)=>{
+        const m = snapshot.val()
+        appendMessage(m)
+      })
+    }
+
+    // --- メッセージ送信 ---
+    async function sendMessage(){
+      const text = messageInput.value.trim()
+      if(!text) return
+      if(!currentRoom) return alert('会話に参加していません')
+      const msgsRef = ref(db, `rooms/${currentRoom}/messages`)
+      await push(msgsRef, {
+        sender: name,
+        text: text,
+        ts: Date.now()
+      })
+      messageInput.value = ''
+    }
+
+    // --- イベント登録 ---
+    createBtn.addEventListener('click', ()=>{ createRoom() })
+    joinBtn.addEventListener('click', ()=>{ joinForm.style.display = joinForm.style.display === 'none' ? 'flex' : 'none' })
+    joinEnter.addEventListener('click', ()=> joinRoomByCode(joinCodeInput.value.trim()))
+    leaveBtn.addEventListener('click', ()=>{
+      currentRoom = null
+      chatScreen.style.display = 'none'
+      homeScreen.style.display = 'block'
+    })
+    sendBtn.addEventListener('click', sendMessage)
+    messageInput.addEventListener('keydown', (e)=>{ if(e.key === 'Enter') sendMessage() })
+
+  </script>
+</body>
+</html>
