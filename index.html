@@ -110,7 +110,7 @@
     };
 
     import { initializeApp } from 'https://www.gstatic.com/firebasejs/9.22.2/firebase-app.js'
-    import { getDatabase, ref, set, get, push, onChildAdded, remove } from 'https://www.gstatic.com/firebasejs/9.22.2/firebase-database.js'
+    import { getDatabase, ref, set, get, push, onChildAdded, off } from 'https://www.gstatic.com/firebasejs/9.22.2/firebase-database.js'
     import { getAuth, signInAnonymously, onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/9.22.2/firebase-auth.js'
 
     const app = initializeApp(firebaseConfig);
@@ -152,7 +152,6 @@
     joinEnter.disabled = true;
     joinToggle.disabled = true;
 
-    // 匿名サインイン
     signInAnonymously(auth).catch(err=>console.error('anonymous sign-in failed',err));
 
     onAuthStateChanged(auth, user=>{
@@ -202,7 +201,7 @@
       });
     }
 
-    // --- ルーム生成 ---
+    // --- ルーム生成（原子的に作る） ---
     async function createRoom(){
       if(!myUid){ alert('認証処理中です。少し待ってから再試行してください。'); return; }
       createBtn.disabled = true;
@@ -210,13 +209,17 @@
       try{
         for(let attempts=0; attempts<8; attempts++){
           const code = genCode(6);
-          // participants/<uid> に先に書き込む
-          const partRef = ref(db, `rooms/${code}/participants/${myUid}`);
+          const roomRef = ref(db, `rooms/${code}`);
+          // 新規ルームは createdAt と participants を一度にセット（ルールと整合）
+          const payload = { createdAt: Date.now(), participants: {} };
+          payload.participants[myUid] = true;
           try{
-            await set(partRef, true);
-          }catch(e){ throw e; }
-          // participants 作成に成功したら、ルームのメタ情報（creator を廃止 — 要望どおり）
-          await set(ref(db, `rooms/${code}/createdAt`), Date.now());
+            await set(roomRef, payload);
+          }catch(e){
+            // 書き込み失敗（衝突や権限）なら別のコードで再試行
+            console.warn('set room failed for code', code, e);
+            continue;
+          }
           addLocalRoom(code);
           createResult.innerHTML = `作成しました。コード: <span class=\"codebox\">${code}</span> <button id=\"copyBtn\">コピー</button> <button id=\"openBtn\" class=\"ghost\">開く</button>`;
           document.getElementById('copyBtn').onclick = ()=>navigator.clipboard.writeText(code);
@@ -236,13 +239,18 @@
       if(!code) return alert('コードを入力してください');
       if(!myUid) return alert('認証中です。少し待ってください。');
       try{
-        // 既に参加中なら即オープン
-        if(joinedRooms.includes(code)){ openRoom(code); return; }
-        const partRef = ref(db, `rooms/${code}/participants/${myUid}`);
-        await set(partRef, true);
+        // まずルームの createdAt を確認（存在しないなら参加不可）
+        const createdSnap = await get(ref(db, `rooms/${code}/createdAt`));
+        if(!createdSnap.exists()){
+          // 存在しない
+          alert('その会話は存在しません');
+          // ローカルに保存していれば削除
+          removeLocalRoom(code);
+          return;
+        }
+        // 参加登録
+        await set(ref(db, `rooms/${code}/participants/${myUid}`), true);
         addLocalRoom(code);
-        // その後ルームのメタデータを読む（読み込み権限が付与されたので可能）
-        try{ await get(ref(db, `rooms/${code}`)); }catch(e){ console.warn('meta read skipped or denied', e); }
         openRoom(code);
       }catch(err){
         console.error('joinRoomByCode error', err);
@@ -252,8 +260,10 @@
       }
     }
 
-    // --- Chat ---
+    // --- Chat: リスナー管理 ---
     let currentRoom = null;
+    let currentMsgsRef = null;
+    let currentChildCallback = null;
 
     function clearMessages(){ messagesEl.innerHTML = ''; }
     function appendMessage(msg){
@@ -272,6 +282,12 @@
     }
 
     async function openRoom(code){
+      // detach previous listener
+      if(currentMsgsRef && currentChildCallback){
+        try{ off(currentMsgsRef, 'child_added', currentChildCallback); }catch(e){ console.warn('off failed', e); }
+        currentMsgsRef = null; currentChildCallback = null;
+      }
+
       currentRoom = code;
       roomCodeEl.textContent = code;
       pageTitle.textContent = `会話：${code}`;
@@ -281,9 +297,9 @@
       clearMessages();
       renderRoomLists();
 
-      // まず、ルームが存在するか確認（participants に自分がいる、または createdAt があるか）
+      // まず存在確認
       try{
-        const roomSnap = await get(ref(db, `rooms/${code}`));
+        const roomSnap = await get(ref(db, `rooms/${code}/createdAt`));
         if(!roomSnap.exists()){
           // ルームが存在しない
           notFoundContainer.style.display = 'block';
@@ -291,26 +307,19 @@
           return;
         }
       }catch(err){
-        // もし読み取り権限で落ちるなら participants への書き込みが必要。ここでは既に参加処理で participants を作っているはず
-        console.warn('openRoom: read error (may be permission-related)', err);
-        // 先に進めてメッセージの購読だけ試みる
+        console.warn('openRoom read error', err);
+        // 読み取りが出来ない場合（ルール等）、続行してリスニングを試みる
       }
 
       messagesEl.style.display = 'flex';
 
-      // 既存メッセージを取得して表示
-      const msgsRefPath = `rooms/${code}/messages`;
+      // ライブで受け取る。onChildAdded は既存メッセージも一度ずつ流すため、既読取得は不要。
+      const msgsRef = ref(db, `rooms/${code}/messages`);
+      const cb = (snapshot)=>{ const m = snapshot.val(); if(m) appendMessage(m); };
       try{
-        const msgsSnap = await get(ref(db, msgsRefPath));
-        if(msgsSnap.exists()){
-          const all = msgsSnap.val();
-          Object.values(all).forEach(m=> appendMessage(m));
-        }
-      }catch(e){ console.warn('existing messages read skipped', e); }
-
-      // ライブで受け取る
-      try{
-        onChildAdded(ref(db, msgsRefPath), (snapshot)=>{ const m = snapshot.val(); appendMessage(m); });
+        onChildAdded(msgsRef, cb);
+        currentMsgsRef = msgsRef;
+        currentChildCallback = cb;
       }catch(e){ console.warn('live message listen failed', e); }
     }
 
@@ -333,14 +342,13 @@
     async function leaveRoom(code){
       if(!code) code = currentRoom;
       if(!code) return;
-      try{ await remove(ref(db, `rooms/${code}/participants/${myUid}`)); }catch(e){ console.warn('participant remove failed', e); }
+      try{ await set(ref(db, `rooms/${code}/participants/${myUid}`), null); }catch(e){ console.warn('participant remove failed', e); }
       removeLocalRoom(code);
       if(currentRoom === code){ currentRoom = null; chatScreen.style.display = 'none'; homeScreen.style.display = 'block'; pageTitle.textContent = 'ホーム'; }
     }
 
     // --- not found のボタン ---
     backHomeBtn.addEventListener('click', ()=>{
-      // ローカルからコードを削除
       if(currentRoom) removeLocalRoom(currentRoom);
       currentRoom = null;
       chatScreen.style.display = 'none';
